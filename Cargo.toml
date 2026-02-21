@@ -1,0 +1,13 @@
+[package]
+name = "nvtree"
+version = "0.0.1"
+edition = "2024"
+authors = ["Goran Mekić <meka@tilda.center>"]
+license = "BSD-2-Clause"
+description = "Library to interact with nvlist"
+readme = "README.md"
+homepage = "https://github.com/nvtree-lib/rust"
+repository = "https://github.com/nvtree-lib/rust"
+
+[build-dependencies]
+cc = "1"
