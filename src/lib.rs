@@ -988,8 +988,8 @@ pub fn nvtree_unpack(buf: &[u8]) -> Result<Nvtree, NvtreeError> {
 
 fn nvtree_unpack_with_descriptors(buf: &[u8], descriptors: &[i32]) -> Result<Nvtree, NvtreeError> {
     let mut descriptor_index = 0;
-    match parse_tree_internal(buf, 0, true, descriptors, &mut descriptor_index) {
-        Ok((mut tree, consumed)) => {
+    match parse_tree_internal(buf, 0, true, None, descriptors, &mut descriptor_index) {
+        Ok((mut tree, consumed, _marker_end)) => {
             if consumed != buf.len() {
                 return Err(NvtreeError::Malformed);
             }
@@ -1367,11 +1367,17 @@ fn parse_tree_internal(
     buf: &[u8],
     start: usize,
     root: bool,
+    bound: Option<usize>,
     descriptors: &[i32],
     descriptor_index: &mut usize,
-) -> Result<(Nvtree, usize), NvtreeError> {
+) -> Result<(Nvtree, usize, Option<usize>), NvtreeError> {
     if buf.len().saturating_sub(start) < TREE_HEADER_LEN {
         return Err(NvtreeError::BufferTooSmall);
+    }
+    if let Some(bound) = bound
+        && bound < start + TREE_HEADER_LEN
+    {
+        return Err(NvtreeError::Malformed);
     }
 
     let magic = buf[start];
@@ -1401,7 +1407,7 @@ fn parse_tree_internal(
         return Err(NvtreeError::DescriptorMissing(descriptor_count));
     }
 
-    let body_len = if root {
+    let mut body_len = if root {
         size
     } else {
         // FreeBSD nvlist streams are observed in two nested-size encodings:
@@ -1414,19 +1420,35 @@ fn parse_tree_internal(
     };
 
     let mut ptr = start + TREE_HEADER_LEN;
-    let body_end = ptr.checked_add(body_len).ok_or(NvtreeError::Malformed)?;
+    let mut body_end = ptr.checked_add(body_len).ok_or(NvtreeError::Malformed)?;
+    if let Some(bound) = bound {
+        // Producers may declare a nested size that exceeds the pair datasize
+        // (observed with FreeBSD kernel sndstat nvlists); the pair datasize is
+        // authoritative for the tree's extent.
+        if body_end > bound {
+            body_end = bound;
+            body_len = bound - ptr;
+        }
+    }
     if body_end > buf.len() {
         return Err(NvtreeError::BufferTooSmall);
     }
 
     let mut tree = nvtree_create(flags);
     let mut descriptor_refs = 0usize;
+    let mut marker_end: Option<usize> = None;
 
     while ptr < body_end {
         let ty = read_u8(buf, &mut ptr)?;
         let namesize = read_u16(buf, &mut ptr, byte_order)? as usize;
         let datasize = read_u64(buf, &mut ptr, byte_order)? as usize;
         let nitems = read_u64(buf, &mut ptr, byte_order)? as usize;
+        if std::env::var("NVTREE_DEBUG").is_ok() {
+            eprintln!(
+                "nvtree-debug: off={} ty={} namesize={} datasize={} nitems={}",
+                ptr, ty, namesize, datasize, nitems
+            );
+        }
 
         if namesize == 0 || namesize > 2048 || ptr + namesize > body_end {
             return Err(NvtreeError::InvalidName);
@@ -1526,8 +1548,21 @@ fn parse_tree_internal(
                 if ptr + datasize > body_end {
                     return Err(NvtreeError::BufferTooSmall);
                 }
-                let (nested, consumed) =
-                    parse_tree_internal(buf, ptr, false, descriptors, descriptor_index)?;
+                let (nested, consumed, _marker_end) = parse_tree_internal(
+                    buf,
+                    ptr,
+                    false,
+                    Some(ptr + datasize),
+                    descriptors,
+                    descriptor_index,
+                )?;
+                if std::env::var("NVTREE_DEBUG").is_ok() {
+                    eprintln!(
+                        "nvtree-debug: nested pair name={name} datasize={datasize} consumed={consumed} rem={} byte_after={}",
+                        datasize.saturating_sub(consumed),
+                        buf.get(ptr + consumed).copied().unwrap_or(0)
+                    );
+                }
                 if consumed > datasize {
                     return Err(NvtreeError::Malformed);
                 }
@@ -1675,14 +1710,31 @@ fn parse_tree_internal(
                     body_end
                 };
                 let mut values = Vec::with_capacity(nitems);
-                for _ in 0..nitems {
+                for i in 0..nitems {
+                    if std::env::var("NVTREE_DEBUG").is_ok() {
+                        eprintln!(
+                            "nvtree-debug: array[{name}] elem {i} at ptr={ptr} data_end={data_end} next_ty={}",
+                            buf.get(ptr).copied().unwrap_or(0)
+                        );
+                    }
                     if ptr >= data_end {
                         return Err(NvtreeError::Malformed);
                     }
-                    let (nested, consumed) =
-                        parse_tree_internal(buf, ptr, false, descriptors, descriptor_index)?;
+                    let (nested, consumed, marker_end) = parse_tree_internal(
+                        buf,
+                        ptr,
+                        false,
+                        Some(data_end),
+                        descriptors,
+                        descriptor_index,
+                    )?;
+                    if std::env::var("NVTREE_DEBUG").is_ok() {
+                        eprintln!(
+                            "nvtree-debug: array elem {i} consumed={consumed} marker_end={marker_end:?}"
+                        );
+                    }
                     values.push(nested);
-                    ptr += consumed;
+                    ptr = marker_end.unwrap_or_else(|| ptr + consumed);
 
                     // Some producers append explicit END markers between array elements.
                     if ptr + PAIR_HEADER_LEN < data_end
@@ -1710,6 +1762,17 @@ fn parse_tree_internal(
                 if root {
                     return Err(NvtreeError::Malformed);
                 }
+                // The terminator's name bytes belong to this tree. Some
+                // producers (FreeBSD kernel sndstat nvlists) declare a size
+                // that spans the rest of the buffer, so the position after
+                // the terminator is the only reliable extent signal.
+                if std::env::var("NVTREE_DEBUG").is_ok() {
+                    eprintln!(
+                        "nvtree-debug: tree at {start} ends on marker ty={ty} marker_end={}",
+                        ptr
+                    );
+                }
+                marker_end = Some(ptr);
                 break;
             }
             other => return Err(NvtreeError::UnsupportedType(other)),
@@ -1730,7 +1793,7 @@ fn parse_tree_internal(
         return Err(NvtreeError::Malformed);
     }
 
-    Ok((tree, TREE_HEADER_LEN + body_len))
+    Ok((tree, TREE_HEADER_LEN + body_len, marker_end))
 }
 
 fn names_equal(flags: u8, left: &str, right: &str) -> bool {
