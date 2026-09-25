@@ -162,6 +162,11 @@ impl Nvtpair {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nvtree {
     pub flags: u8,
+    /// File descriptors received with this tree's ancillary data.
+    ///
+    /// Descriptors are not part of the serialized byte stream, so this is
+    /// populated by the transport-aware receive path.
+    pub descriptors: Vec<i32>,
     error: i32,
     head: Vec<Nvtpair>,
 }
@@ -169,6 +174,7 @@ pub struct Nvtree {
 pub fn nvtree_create(flags: u8) -> Nvtree {
     Nvtree {
         flags,
+        descriptors: Vec::new(),
         error: 0,
         head: Vec::new(),
     }
@@ -971,17 +977,26 @@ pub fn nvtree_pack_endian(
     Ok((bytes, state.descriptors))
 }
 
-/// Unpack an nvlist using the descriptor ancillary-data list supplied with it.
-pub fn nvtree_unpack(buf: &[u8], descriptors: &[i32]) -> Result<Nvtree, NvtreeError> {
+/// Unpack an nvlist from its serialized bytes.
+///
+/// Descriptor values are ancillary data and therefore cannot be recovered
+/// from `buf` alone. Use the transport receive functions when the stream has
+/// descriptor ancillary data.
+pub fn nvtree_unpack(buf: &[u8]) -> Result<Nvtree, NvtreeError> {
+    nvtree_unpack_with_descriptors(buf, &[])
+}
+
+fn nvtree_unpack_with_descriptors(buf: &[u8], descriptors: &[i32]) -> Result<Nvtree, NvtreeError> {
     let mut descriptor_index = 0;
     match parse_tree_internal(buf, 0, true, descriptors, &mut descriptor_index) {
-        Ok((tree, consumed)) => {
+        Ok((mut tree, consumed)) => {
             if consumed != buf.len() {
                 return Err(NvtreeError::Malformed);
             }
             if descriptor_index != descriptors.len() {
                 return Err(NvtreeError::Malformed);
             }
+            tree.descriptors = descriptors.to_vec();
             Ok(tree)
         }
         Err(err) => Err(err),
@@ -1025,7 +1040,7 @@ pub fn nvtree_recv<R: Read>(reader: &mut R, descriptors: &[i32]) -> io::Result<N
     let mut bytes = header.to_vec();
     bytes.resize(TREE_HEADER_LEN + body_size, 0);
     reader.read_exact(&mut bytes[TREE_HEADER_LEN..])?;
-    nvtree_unpack(&bytes, descriptors)
+    nvtree_unpack_with_descriptors(&bytes, descriptors)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("{error:?}")))
 }
 
@@ -1055,7 +1070,7 @@ pub fn nvtree_send_fd(fd: RawFd, root: &Nvtree) -> io::Result<()> {
 
 pub fn nvtree_recv_fd(fd: RawFd) -> io::Result<(Nvtree, Vec<RawFd>)> {
     let (bytes, descriptors) = transport::recv(fd)?;
-    match nvtree_unpack(&bytes, &descriptors) {
+    match nvtree_unpack_with_descriptors(&bytes, &descriptors) {
         Ok(tree) => Ok((tree, descriptors)),
         Err(error) => {
             for descriptor in descriptors {
@@ -1794,7 +1809,7 @@ mod tests {
     }
 
     fn nvtree_unpack(buf: &[u8]) -> Result<Nvtree, NvtreeError> {
-        super::nvtree_unpack(buf, &[])
+        super::nvtree_unpack(buf)
     }
 
     fn read_u16_raw(buf: &[u8], off: usize, is_be: bool) -> u16 {
@@ -2193,7 +2208,7 @@ mod tests {
 
         for endian in [NvtreeEndian::Little, NvtreeEndian::Big] {
             let (packed, descriptors) = super::nvtree_pack_endian(&root, endian).unwrap();
-            let decoded = super::nvtree_unpack(&packed, &descriptors).unwrap();
+            let decoded = super::nvtree_unpack_with_descriptors(&packed, &descriptors).unwrap();
             assert_eq!(decoded, root);
         }
     }
@@ -2254,7 +2269,7 @@ mod tests {
 
         let (packed, descriptors) = super::nvtree_pack(&root).unwrap();
         assert_eq!(descriptors, vec![42, 99]);
-        let unpacked = super::nvtree_unpack(&packed, &descriptors).unwrap();
+        let unpacked = super::nvtree_unpack_with_descriptors(&packed, &descriptors).unwrap();
         assert_eq!(
             nvtree_find(&unpacked, "fd").unwrap().value,
             Nvtvalue::Descriptor(42)
@@ -2602,9 +2617,10 @@ mod tests {
         let (bytes, fds) = super::nvtree_pack(&descriptors).unwrap();
         assert_eq!(fds, vec![11, 22]);
         assert_eq!(
-            super::nvtree_unpack(&bytes, &[101, 202]).unwrap(),
+            super::nvtree_unpack_with_descriptors(&bytes, &[101, 202]).unwrap(),
             Nvtree {
                 flags: 0,
+                descriptors: vec![101, 202],
                 error: 0,
                 head: vec![
                     nvtree_descriptor("first", 101),
@@ -2613,7 +2629,7 @@ mod tests {
             }
         );
         assert!(matches!(
-            super::nvtree_unpack(&bytes, &[101]),
+            super::nvtree_unpack_with_descriptors(&bytes, &[101]),
             Err(NvtreeError::DescriptorMissing(_))
         ));
     }
